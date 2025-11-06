@@ -224,3 +224,81 @@ In this part, you need to convert a C system call into a shared library so that 
 ```bash
 unsigned long my_get_physical_addresses(void *va)
 ```
+可用於查詢虛擬位址 (VA) 與實體位址 (PA) 的映射關係。
+
+本題的目標是將該 system call 轉換為 動態共享函式庫 (.so)，使其能夠被 Python (ctypes) 直接呼叫，並透過高階語言觀察記憶體配置行為，包括：  
+
+- heap 區 (malloc/sbrk) 成長過程
+- lazy allocation 與 page fault 配頁
+---
+### 實驗目標
+1. 實作一個 C wrapper，將 system call 封裝為可供 Python 呼叫的共享函式。
+2. 於 Python 中使用 ctypes 載入 .so 並呼叫該函式。
+3. 透過 Python 程式分配記憶體、檢查對應的物理位址變化，觀察 lazy allocation 行為。
+
+---
+### 實驗環境
+| 項目 | 設定值|
+| :-- | :-- |
+| 作業系統  | Ubuntu 22.04 LTS |
+| Kernel 版本  | Linux 5.15.137 |
+| System call number  | 449 |
+| 測試語言  | Python 3.12 |
+| 介接方法  | ctypes + Shared Library (.so) |
+
+***
+### C Wrapper 實作
+- **建立cwrapper.c**
+```bash
+sudo su
+
+cd /usr/src/linux-5.15.137/project1
+
+vim cwrapper.c
+```
+```c
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <errno.h>
+#include <stdint.h>
+
+#ifndef SYS_GET_PHY
+#define SYS_GET_PHY 449
+#endif
+
+
+__attribute__((visibility("default")))
+unsigned long my_get_physical_addresses(void *va) {
+    long ret = syscall(SYS_GET_PHY, va);
+    if (ret < 0) return 0;         
+    return (unsigned long)ret;
+}
+
+```
+***
+- **編譯成共享函式庫**
+```bash
+gcc -Wall -O2 -fPIC -shared -o lib_my_get_phy.so cwrapper.c
+```
+成功後會產生：
+```bash
+lib_my_get_phy.so
+```
+
+***
+- **測試驗證**
+  
+回到原本檔案資料夾中執行測試程式
+```bash
+python3 test_q2.py
+```
+
+---
+## 結果分析
+| 現象 | 解釋 |
+| :-- | :-- |
+| 只有部分頁面有 PA  | `malloc()` 或 `create_string_buffer()` 內部清零會觸碰前幾頁，導致立即分配實體頁。 |
+| 其餘頁面顯示「未分配」  | 	屬於尚未被觸碰的虛擬頁面，lazy allocation 尚未觸發。 |
+| program break 成長  | 代表 heap 空間擴張，對應 sbrk 的行為。 |
+
