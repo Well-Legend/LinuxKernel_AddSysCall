@@ -50,7 +50,12 @@ This mechanism, where physical memory is allocated only on first access, is call
 在現代作業系統中，每個執行中的程式（process）都擁有獨立的虛擬位址空間。
 CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virtual Address, VA**）轉換為**實體位址**（**Physical Address, PA**）。
 
-本實驗的目標是實作一個**新的 Linux system call**，用於查詢給定虛擬位址目前對應的實體位址，並觀察記憶體的 lazy allocation 行為。
+此外，一個程式（process）底下可以包含多個執行緒（thread），這些執行緒共享同一個虛擬位址空間，卻各自擁有獨立的核心堆疊（kernel stack）與執行緒控制區塊（例如 Linux 中的 task_struct）。作業系統必須透過這些資料結構來管理排程、記憶體與權限，並藉由 mm_struct 及其頁目錄（pgd）來描述整個行程的位址空間。
+
+本實驗的目標是實作2個**新的 Linux system call**:   
+1. 用於**查詢給定虛擬位址目前對應的實體位址**，並觀察記憶體的 lazy allocation 行為。  
+
+2. 則是用於查詢**目前呼叫該 system call 的執行緒**在核心中的關鍵資訊，包括：**執行緒的 pid、所屬行程的 tgid、對應的 process descriptor（task_struct）位址、核心模式堆疊起始位址，以及該行程所使用之頁目錄（pgd）位址**。透過撰寫單執行緒與多執行緒的測試程式並呼叫此 system call，實驗將引導我們觀察並驗證：同一個 process 中不同 thread 的 pid/tgid 關係、各自獨立的 kernel stack 與 task_struct 位址，以及共享的虛擬位址空間（pgd），從而更加具體地理解 Linux 核心內部對 process 與 thread 的實作方式  
 
 ### 實作
 - **新增syscall**  
@@ -69,7 +74,7 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
 	```
  	***
  
-- **建立新檔案**
+- **建立第一個system call的新檔案**
 	```bash
 	vim my_get_physical_addresses.c
 	```
@@ -118,6 +123,62 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
 	```
 	***
 
+- **建立第二個system call的新檔案**
+	```bash
+	vim my_get_thread_kernel_info.c
+	```
+	並填入 code
+	```c
+	#include <linux/kernel.h>
+	#include <linux/syscalls.h>
+	#include <linux/sched.h>    // current, task_struct
+	#include <linux/mm.h>       // mm_struct
+	#include <linux/uaccess.h>  // copy_to_user
+	#include <asm/current.h>
+
+	struct my_thread_info_record {
+		unsigned long pid;
+		unsigned long tgid;
+		void *process_descriptor_address;
+		void *kernel_mode_stack_address;
+		void *pgd_table_address;
+	};
+
+	SYSCALL_DEFINE1(my_get_thread_kernel_info, void __user *, user_buf)
+	{
+		struct my_thread_info_record info;
+		struct task_struct *tsk = current;
+		struct mm_struct *mm;
+
+		if (!user_buf)
+			return 0;
+
+		/* 1. pid / tgid */
+		info.pid  = (unsigned long)tsk->pid;
+		info.tgid = (unsigned long)tsk->tgid;
+
+		/* 2. process descriptor 位址 (task_struct*) */
+		info.process_descriptor_address = (void *)tsk;
+
+		/* 3. kernel 模式 stack */
+		info.kernel_mode_stack_address = (void *)tsk->stack;
+
+		/* 4. pgd table 位址 */
+		mm = tsk->mm ? tsk->mm : tsk->active_mm;
+		if (mm)
+			info.pgd_table_address = (void *)mm->pgd;
+		else
+			info.pgd_table_address = NULL;
+
+		/* 5. 丟回 user space */
+		if (copy_to_user(user_buf, &info, sizeof(info)))
+			return 0;       // 拷貝失敗
+
+		return 1;           // 成功
+	}
+	```
+	***
+
 - **在 project1 資料夾中建立 Makefile**
 	```bash
 	vim Makefile
@@ -126,9 +187,9 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
 	並填入 code
 
 	```bash
-	# 將my_get_physical_addresses.o編入kernel
+	# 將 my_get_physical_addresses.o 和 my_get_thread_kernel_info.o 編入 kernel
 	
-	obj-y := my_get_physical_addresses.o 
+	obj-y := my_get_physical_addresses.o my_get_thread_kernel_info.o 
 	```
  	Makefile功能 : 告訴 make 如何編譯這些檔案  
 	Makefile 的主要目的是讓 make 工具知道如何根據源代碼的變化來更新和編譯目標檔案，以及確保這些操作按照正確的順序執行。
@@ -162,6 +223,8 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
   並在`#endif`前加上
   ```bash
   asmlinkage long sys_my_get_physical_addresses(unsigned long __user *usr_ptr);
+
+  asmlinkage long sys_my_get_thread_kernel_info(void __user *user_buf);
   ```
 
 	當 assembly code 呼叫 C function，並且是以 stack 方式傳參數（parameter）時，在 C function 的 prototype 前面就要加上 "asmlinkage"。
@@ -173,7 +236,9 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
   ```
   拉至其底部。會發現一系列 x32 系統呼叫。滾動到其上方的section。並插入
   ```bash
-  449	common	my_get_physical_addresses		sys_my_get_physical_addresses
+  449	common	my_get_physical_addresses	sys_my_get_physical_addresses
+
+  450	common	my_get_thread_kernel_info	sys_my_get_thread_kernel_info
   ```
   使用 Tab 來表示空格，勿使用空白鍵!!
 
@@ -210,8 +275,17 @@ CPU與作業系統透過**頁表** (**page table**) 將**虛擬位址**（**Virt
   
 ### 測試驗證
 ```bash
-gcc -O2 -o test_q1 test_q1.c
-./test_q1.c
+# Virtual Address 轉 Physical Address
+gcc -O2 -o test_address_trans test_address_trans.c
+./test_address_trans.c
+
+# 呼叫該 system call 的執行緒 - single-thread program
+gcc single.c -o single
+./single
+
+# 呼叫該 system call 的執行緒 - multi-thread program
+gcc multi.c -o multi -lpthread
+./multi
 ```
 
 ***
@@ -302,3 +376,15 @@ python3 test_q2.py
 | 其餘頁面顯示「未分配」  | 	屬於尚未被觸碰的虛擬頁面，lazy allocation 尚未觸發。 |
 | program break 成長  | 代表 heap 空間擴張，對應 sbrk 的行為。 |
 
+
+***
+Question 3
+---
+In this part, you need to define new data type and write a new system call int my_get_thread_kernel_info(void *) so that a thread can use the new system call to collect some information of a thread.  
+The return value of this system call is an integer. 0 means that an error occurs when executing this system call. A non-zero value means that the system is executed successfully. You can also utilize the return value to tranfer information you need.
+
+### 專案說明
+
+```bash
+int my_get_thread_kernel_info(void *)
+```
